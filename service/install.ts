@@ -28,7 +28,8 @@ const execCommand = async (file: string, args: string[]) => {
 };
 const AGENTS = join(homedir(), "Library/LaunchAgents");
 const MIN_MEMORY_BYTES = 8 * 1024 ** 3;
-const DISK_RESERVE_BYTES = 2 * 1024 ** 3;
+// Covers both models, compressed/extracted helper, activation copy, and a 2 GiB free-space reserve.
+const SETUP_DISK_BYTES = 4 * 1024 ** 3;
 const SERVICE_WAIT_MS = 15000;
 const POLL_MS = 250;
 const LAUNCHD_IO_ERROR = 5;
@@ -44,8 +45,14 @@ async function stopService(run: Execute): Promise<void> {
   const target = `gui/${process.getuid!()}/${AGENT_LABEL}`;
   try {
     await run("/bin/launchctl", ["print", target]);
-  } catch {
-    return;
+  } catch (error) {
+    // Only a missing registration is harmless; permission and transport failures must reach the user.
+    if (
+      (error as { stderr?: string }).stderr?.includes("Could not find service")
+    ) {
+      return;
+    }
+    throw error;
   }
   await run("/bin/launchctl", ["bootout", target]);
 }
@@ -236,13 +243,8 @@ export async function installService(
   let stage: string | undefined;
   try {
     const disk = await statfs(locations.base);
-    if (
-      disk.bavail * disk.bsize <
-      DISK_RESERVE_BYTES +
-        HELPER.bytes +
-        MODELS.reduce((sum, model) => sum + model.bytes, 0)
-    ) {
-      throw new Error("Not enough disk space; setup needs 3 GB free");
+    if (disk.bavail * disk.bsize < SETUP_DISK_BYTES) {
+      throw new Error("Not enough disk space; setup needs 4 GB free");
     }
     stage = await mkdtemp(join(locations.base, "setup-"));
     await mkdir(locations.models, { recursive: true, mode: 0o700 });

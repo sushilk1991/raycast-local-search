@@ -96,9 +96,9 @@ ${error ? `Setup stopped: ${error}\n\nCheck your connection and free disk space,
 
 ## First setup
 
-The helper and EmbeddingGemma 2 models download once (about 905 MB total). Downloads are pinned and SHA-256 verified. Requires Apple Silicon, macOS 14+, 8 GB RAM, and 3 GB free disk space. Keep this command open until setup finishes.
+The helper and EmbeddingGemma 2 models download once (about 905 MB total). Downloads are pinned and SHA-256 verified. Requires Apple Silicon, macOS 14+, 8 GB RAM, and 4 GB free disk space. Keep this command open until setup finishes.
 
-After setup, open **Manage Content Index → Choose Folders and Limits**. Start with a small folder. No personal folders are selected automatically.
+After setup, open **Manage Content Index → Choose Folders and Limits**. Start with a small folder. No personal folders are selected automatically. macOS may ask you to allow access to a selected folder; that permission needs your approval.
 
 ## Background indexing
 

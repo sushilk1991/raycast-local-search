@@ -126,6 +126,17 @@ test("activation readiness failure restores the previous helper", async () => {
   assert.equal(await readFile(join(base, "bin/node"), "utf8"), "old helper");
 });
 
+test("removal does not report success when launchd cannot be inspected", async () => {
+  const base = await mkdtemp(join(tmpdir(), "local-search-removal-error-"));
+  await assert.rejects(
+    removeService(paths(base), join(base, "agents"), async () => {
+      throw new Error("permission denied");
+    }),
+    /permission denied/,
+  );
+  await assert.rejects(access(join(base, "disabled")));
+});
+
 test("concurrent removal cannot acquire an active installation lock", async () => {
   const base = await mkdtemp(join(tmpdir(), "local-search-lock-"));
   let unblock!: () => void;
