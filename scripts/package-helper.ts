@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 const NODE_SHA256 =
   "db4b275b83736df67533529a18cc55de2549a8329ace6c7bcc68f8d22d3c9000";
 const NODE_ARCHIVE = process.argv[2];
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 async function main() {
   if (!NODE_ARCHIVE) {
     throw new Error(

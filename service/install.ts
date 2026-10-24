@@ -31,6 +31,7 @@ const MIN_MEMORY_BYTES = 8 * 1024 ** 3;
 const DISK_RESERVE_BYTES = 2 * 1024 ** 3;
 const SERVICE_WAIT_MS = 15000;
 const POLL_MS = 250;
+const LAUNCHD_IO_ERROR = 5;
 type Execute = typeof execCommand;
 export type InstallProgress = (
   stage: string,
@@ -47,6 +48,31 @@ async function stopService(run: Execute): Promise<void> {
     return;
   }
   await run("/bin/launchctl", ["bootout", target]);
+}
+
+// bootout returns before launchd removes its job; bootstrap can temporarily return EIO.
+async function registerService(plist: string, run: Execute): Promise<void> {
+  const deadline = Date.now() + SERVICE_WAIT_MS;
+  while (true) {
+    try {
+      await run("/bin/launchctl", [
+        "bootstrap",
+        `gui/${process.getuid!()}`,
+        plist,
+      ]);
+      return;
+    } catch (error) {
+      if (
+        (error as { code?: number }).code !== LAUNCHD_IO_ERROR ||
+        Date.now() >= deadline
+      ) {
+        throw error;
+      }
+      await new Promise((done) => {
+        setTimeout(done, POLL_MS);
+      });
+    }
+  }
 }
 
 // Stage before stopping the old service; on failure restore its binaries and registration.
@@ -103,11 +129,7 @@ export async function activateHelper(
       mode: 0o600,
     });
     await run("/usr/bin/plutil", ["-lint", plist]);
-    await run("/bin/launchctl", [
-      "bootstrap",
-      `gui/${process.getuid!()}`,
-      plist,
-    ]);
+    await registerService(plist, run);
     await ready();
     await writeFile(join(locations.base, "installed-version"), HELPER_VERSION, {
       mode: 0o600,
@@ -129,11 +151,7 @@ export async function activateHelper(
       }
       if (previousPlist) {
         await writeFile(plist, previousPlist, { mode: 0o600 });
-        await run("/bin/launchctl", [
-          "bootstrap",
-          `gui/${process.getuid!()}`,
-          plist,
-        ]);
+        await registerService(plist, run);
       } else {
         await unlink(plist).catch(() => {});
       }

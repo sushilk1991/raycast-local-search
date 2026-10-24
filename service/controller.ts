@@ -9,7 +9,8 @@ import {
   mkdir,
   stat,
 } from "node:fs/promises";
-import { watch, FSWatcher, constants } from "node:fs";
+import { constants } from "node:fs";
+import { watchFolders, FolderWatch } from "./watchers";
 import { join } from "node:path";
 import { Paths } from "./paths";
 import { selectedPath } from "./selection";
@@ -55,7 +56,7 @@ export class Controller {
   private missingRoots: string[] = [];
   private error: string | undefined;
   private worker: WorkerRun | undefined;
-  private watchers: FSWatcher[] = [];
+  private watcher: FolderWatch | undefined;
   private reconcile: NodeJS.Timeout | undefined;
   private powerTimer: NodeJS.Timeout | undefined;
   private scheduled: NodeJS.Timeout | undefined;
@@ -300,9 +301,7 @@ export class Controller {
     if (this.scheduled) {
       clearTimeout(this.scheduled);
     }
-    for (const watcher of this.watchers) {
-      watcher.close();
-    }
+    this.watcher?.close();
     await this.stopWorker();
     // Drain writes already in flight; their late guards prevent new workers/watchers after shutdown.
     await this.configQueue;
@@ -368,23 +367,17 @@ export class Controller {
   }
 
   private resetWatchers(): void {
-    for (const watcher of this.watchers) {
-      watcher.close();
-    }
-    this.watchers = [];
-    for (const root of this.config.roots) {
-      try {
-        const watcher = watch(root, { recursive: true }, () => {
-          this.markDirty();
-        });
-        watcher.on("error", (error) => {
-          this.error = `Folder watcher: ${error.message}; periodic rescans remain enabled`;
-        });
-        this.watchers.push(watcher);
-      } catch {
-        /* Disconnected drives are retried during periodic reconciliation. */
-      }
-    }
+    // Watch startup can wait for macOS folder permission; it must not block service readiness or controls.
+    this.watcher?.close();
+    this.watcher = watchFolders(
+      this.config.roots,
+      () => {
+        this.markDirty();
+      },
+      (message) => {
+        this.error = `Folder watcher: ${message}; periodic rescans remain enabled`;
+      },
+    );
   }
 
   private async clearIndex(): Promise<void> {

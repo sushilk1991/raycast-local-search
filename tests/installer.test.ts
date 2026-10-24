@@ -75,6 +75,32 @@ test("activation registers a self-contained helper and removal preserves user da
   );
 });
 
+test("registration retries while launchd finishes removing the previous job", async () => {
+  const base = await mkdtemp(join(tmpdir(), "local-search-registration-"));
+  const helper = join(base, "helper");
+  await mkdir(join(helper, "bin"), { recursive: true });
+  await mkdir(join(helper, "licenses"));
+  for (const file of ["node", "local-search-engine", "service.cjs"]) {
+    await writeFile(join(helper, "bin", file), "fixture");
+  }
+  let attempts = 0;
+  const run = async (_file: string, args: string[]) => {
+    if (args[0] === "bootstrap" && ++attempts < 3) {
+      throw Object.assign(new Error("launchd removal still in progress"), {
+        code: 5,
+      });
+    }
+  };
+  await activateHelper(
+    helper,
+    paths(base),
+    join(base, "agents"),
+    run,
+    async () => {},
+  );
+  assert.equal(attempts, 3);
+});
+
 test("activation readiness failure restores the previous helper", async () => {
   const base = await mkdtemp(join(tmpdir(), "local-search-rollback-"));
   const helper = join(base, "helper");
