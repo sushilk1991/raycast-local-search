@@ -10,5 +10,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src", "service", "tests", "scripts"]
+  "include": ["raycast-env.d.ts", "src", "service", "tests", "scripts"]
 }

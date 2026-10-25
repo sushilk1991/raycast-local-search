@@ -57,7 +57,7 @@ async function main() {
     JSON.stringify(manifest, null, 2) + "\n",
   );
   const config = JSON.parse(await readFile("tsconfig.json", "utf8"));
-  config.include = ["src", "service"];
+  config.include = ["raycast-env.d.ts", "src", "service"];
   await writeFile(
     join(target, "tsconfig.json"),
     JSON.stringify(config, null, 2) + "\n",

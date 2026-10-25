@@ -18,7 +18,10 @@ The development installer uses your current Node. The Store installer uses the r
 
 ## Local release gate
 
+Build first on a fresh checkout so Raycast generates raycast-env.d.ts for the Preferences type.
+
 ```sh
+npm run build
 npm test
 npm run lint
 npm run typecheck
@@ -28,6 +31,8 @@ npm run test:e2e
 npm audit
 npx ray lint --exit-on-error
 ```
+
+`npx tsx scripts/offline-proof.ts` stops the installed service, forbids fetch, and verifies recovery with cached files and unchanged configuration. It restores normal registration if verification fails.
 
 E2E uses synthetic files and real models. Fixture generation requires macOS `say` and `ffmpeg`; neither is a runtime dependency.
 

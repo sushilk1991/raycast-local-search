@@ -16,7 +16,7 @@ The helper is a public, versioned GitHub release containing the native engine, N
 - After selecting two synthetic documents, the released helper returned lease.txt first for “restrictions on domestic animals” in 496 ms and 860 ms across two clean-install runs. This was a real EmbeddingGemma 2 query, not a mocked result or a UI screenshot.
 - Removal stopped the socket service. Reinstallation restored the normal service using its bundled Node and preserved the existing saved configuration. No personal folders were added or removed by the test.
 - The broader real-model E2E passed semantic retrieval, watcher updates, pause/resume without Raycast, unavailable-folder retention, deletions, secret exclusions, PDF/image/audio/video matches, native scope, Unicode paths, and final-folder cleanup.
-- 46 TypeScript tests, 80 native core tests, and 6 native runtime/reference tests pass (132 total). Lint, typecheck, native/extension builds, Raycast validation, and npm audit pass. Audit reports no vulnerabilities.
+- 53 TypeScript tests, 80 native core tests, and 6 native runtime/reference tests pass (139 total). Lint, typecheck, native/extension builds, Raycast validation, and npm audit pass. Audit reports no vulnerabilities.
 
 The runtime-only Store package also passes npm install, Raycast lint, and plain ray build. It contains no native source/tests, scripts, docs, examples, tsx, or separate service-build dependency. Its explicit `ray build -e dist` output was then loaded into Raycast: the minified Search command returned the synthetic lease excerpt, and its Manage action opened the live three-file index.
 
@@ -27,9 +27,19 @@ The runtime-only Store package also passes npm install, Raycast lint, and plain 
 - A failed rollback could delete the only backup of an older helper. The backup is now retained if rollback cannot complete; its regression failed before the fix.
 - Removal could hide a launchd inspection error and report success. Only an explicitly missing job is ignored now; permission/transport failures are shown to the user.
 
+## Follow-up review fixes
+
+- Setup ownership now uses macOS `lockf -k` on a permanent inode, held by a pipe-controlled system helper. No PID parsing, stale-file deletion, or PID-file write can grant ownership. Empty/partial/dead-PID files and two forced stale-recovery contenders are covered; a real owner process is killed to verify crash recovery. The portable command form avoids newer descriptor-only lockf syntax.
+- An intact helper with an unavailable socket reports stopped and restarts from installed files. The real launchd restart passed with fetch disabled and zero network requests; configuration stayed byte-for-byte unchanged. Explicit removal still prevents automatic restart, and missing files require setup. Restart failure offers offline retry or explicit online repair.
+- Preferences use Raycast's generated Preferences type. Both root and staged TypeScript configurations include raycast-env.d.ts; the file remains generated, not committed.
+- Live UI verification exposed duplicate startup effects racing their own lock. A command-local shared operation now coalesces those calls. Regression tests cover replay and retry; the distribution UI recovered the stopped service and displayed Ready without the stale failure message.
+
+One early parallel run timed out waiting for an unchanged lifecycle fixture. It passed alone, and the complete serial and parallel reruns passed without changing the test timeout. The cause of that transient failure was not established.
+
 ## Reproduce as a developer
 
 ```sh
+npm run build
 npm test
 npm run test:native
 npm run test:e2e
@@ -38,6 +48,7 @@ npm run typecheck
 npm run build
 npm audit
 npx tsx scripts/store-proof.ts
+npx tsx scripts/offline-proof.ts
 ```
 
 store-proof.ts temporarily uses this extension's launchd label, exercises fresh public downloads and synthetic files, and restores the normal installation afterward. Do not run it concurrently with another installation. Test dependencies belong in this source repository, not the Store package.
