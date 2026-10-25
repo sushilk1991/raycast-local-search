@@ -1,6 +1,6 @@
 # Store installation verification
 
-Not verified: Raycast result rendering and Store screenshots. Orca could not read Raycast's accessibility window, despite macOS reporting Accessibility and Screen Recording permissions as granted. No screenshots were fabricated, edited, or submitted. The Store PR must remain a draft until at least two actual Window Capture images are added.
+Search results, the detail pane, and Manage Content Index were verified in Raycast with a real synthetic index. Both required Store images were captured by Raycast's native Capture Window command, reviewed, and copied unchanged into metadata/.
 
 ## What users do
 
@@ -18,7 +18,7 @@ The helper is a public, versioned GitHub release containing the native engine, N
 - The broader real-model E2E passed semantic retrieval, watcher updates, pause/resume without Raycast, unavailable-folder retention, deletions, secret exclusions, PDF/image/audio/video matches, native scope, Unicode paths, and final-folder cleanup.
 - 46 TypeScript tests, 80 native core tests, and 6 native runtime/reference tests pass (132 total). Lint, typecheck, native/extension builds, Raycast validation, and npm audit pass. Audit reports no vulnerabilities.
 
-The runtime-only Store package also passes npm install, Raycast lint, and plain ray build. It contains no native source/tests, scripts, docs, examples, tsx, or separate service-build dependency.
+The runtime-only Store package also passes npm install, Raycast lint, and plain ray build. It contains no native source/tests, scripts, docs, examples, tsx, or separate service-build dependency. Its explicit `ray build -e dist` output was then loaded into Raycast: the minified Search command returned the synthetic lease excerpt, and its Manage action opened the live three-file index.
 
 ## Failures found during installation testing
 
@@ -42,6 +42,22 @@ npx tsx scripts/store-proof.ts
 
 store-proof.ts temporarily uses this extension's launchd label, exercises fresh public downloads and synthetic files, and restores the normal installation afterward. Do not run it concurrently with another installation. Test dependencies belong in this source repository, not the Store package.
 
-## Pending
+## Native UI and screenshots
 
-Capture Search File Contents with a synthetic match/detail pane and Manage Content Index using Raycast Window Capture with Save to Metadata. Keep the captures unmodified. Then verify the visible screens, add metadata to the PR, and mark it ready for review. Older supported macOS versions and an actual iCloud eviction remain untested.
+- [Search and detail pane](../metadata/local-content-search-1.png): “restrictions on domestic animals” returns lease.txt and its actual indexed excerpt.
+- [Manage Content Index](../metadata/local-content-search-2.png): three synthetic files, zero pending work, three vectors, and the selected Sample Documents folder.
+
+Both images are native 2000×1250 PNGs, dark mode, default interface size, Raycast 2.9.0 on an Apple Silicon Mac running macOS 27.0.1. They use the same wallpaper. No resize, recolouring, reframing, annotations, or generated replacement content was applied. Their SHA-256 values match the original desktop captures:
+
+```text
+299034bcca966934992e98c61f362b55176a1361b5eec2ee3ee7966dbef611c1  local-content-search-1.png
+5d8ea338bcdad214951f0fb39f0bb6bafa71285d4edbe3197c07c237c7e29ada  local-content-search-2.png
+```
+
+This Raycast version saves native captures to the Desktop; the unchanged files were copied into metadata/. Automated capture was unreliable, so the operator triggered the final capture manually. Accessibility worked without a permission toggle; the earlier permission diagnosis was not established.
+
+scripts/ui-proof.ts serves a separate synthetic index on the normal socket while the normal LaunchAgent is temporarily stopped. It never replaces the user's configuration or index. After capture, it restored the normal service, checked health, and verified the saved configuration was byte-for-byte unchanged. Temporary Capture Window and development-window preferences were restored afterward.
+
+## Limits
+
+Older supported macOS versions and an actual iCloud eviction remain untested. The Store review and merge are still the maintainers' decision.

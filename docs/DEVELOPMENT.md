@@ -51,4 +51,6 @@ npm run build
 
 The allowlist excludes native/build source, development scripts, tests, fixtures, docs, generated reports, and tsx. Never submit STATE.md, PROGRESS.md, local logs, account screenshots, downloaded models, or helper binaries to raycast/extensions.
 
-Capture at least two actual Raycast command windows using Window Capture with Save to Metadata. Use synthetic data only. Do not edit, resize, or recolour those captures.
+Capture at least two actual Raycast command windows using the native Capture Window command. Use Save to Metadata where available; Raycast 2.9 saves to Desktop, so copy those original PNGs into metadata/. Use synthetic data only. Do not edit, resize, or recolour the captures.
+
+For isolated UI verification, run `npx tsx scripts/ui-proof.ts` after the normal service is installed. It temporarily replaces only the socket service with a synthetic index; the normal configuration and index stay untouched. Keep the process running while inspecting Search and Manage, then stop it with Ctrl-C. Confirm its RESTORED message before finishing. Do not run another installation concurrently.

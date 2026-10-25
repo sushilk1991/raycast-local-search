@@ -106,7 +106,7 @@ async function main() {
     ],
   }).sha;
   const next = api("git/commits", {
-    message: "Install the search helper from Store commands",
+    message: process.argv[4] ?? "Install the search helper from Store commands",
     tree: rootTree,
     parents: [head],
   }).sha;
