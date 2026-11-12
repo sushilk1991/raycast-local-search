@@ -139,3 +139,119 @@ import Testing
         #expect(report.candidates.map { ($0.path as NSString).lastPathComponent } == ["trip.txt"])
     }
 }
+
+// A crawl repeats for as long as the service runs: it must stay out of trees that hold nothing of the user's.
+@Suite struct CrawlPruningTests {
+    let folder: URL = {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("DigUpPrune-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }()
+
+    private func write(_ path: String, _ text: String = "notes") throws {
+        let url = folder.appendingPathComponent(path)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(text.utf8).write(to: url)
+    }
+
+    private func names(_ report: CrawlReport) -> [String] {
+        report.candidates.map { String($0.path.dropFirst(FolderSelection.realPath(folder.path).count + 1)) }.sorted()
+    }
+
+    @Test func kindsComeFromExtensionsAlone() throws {
+        for name in ["a.pdf", "photo.png", "Screenshot 2026-11-12 at 10.00.00.png", "song.mp3", "clip.mov", "notes.md",
+                     "data.bin", "README"] {
+            try write(name)
+        }
+        let kinds = Dictionary(uniqueKeysWithValues: Crawler.crawl([folder], options: IndexOptions()).candidates.map {
+            (($0.path as NSString).lastPathComponent, $0.kind)
+        })
+        #expect(kinds == ["a.pdf": .pdf, "photo.png": .image, "Screenshot 2026-11-12 at 10.00.00.png": .screenshot,
+                          "song.mp3": .audio, "clip.mov": .video, "notes.md": .doc])
+    }
+
+    @Test func packageStoresCachesAndEnvironmentsAreNotWalked() throws {
+        try write("keep/plan.txt")
+        try write("node_modules/pkg/readme.md")
+        try write("Caches/thing/readme.md")
+        try write("tool/CACHEDIR.TAG", "Signature: 8a477f597d28d172789f06886806bc55")
+        try write("tool/registry/readme.md")
+        try write("env/pyvenv.cfg", "home = /usr/bin")
+        try write("env/lib/readme.md")
+        try write("private/.metadata_never_index", "")
+        try write("private/diary.txt")
+        let report = Crawler.crawl([folder], options: IndexOptions())
+        #expect(names(report) == ["keep/plan.txt"])
+        #expect(report.skippedFolders == ["developer folder": 1, "cache folder": 2, "python environment": 1,
+                                          "marked not to index": 1])
+    }
+
+    @Test func aReposOwnCacheFolderIsStillCode() throws {
+        try write("repo/cache/store.swift", "struct Store {}")
+        try write("repo/node_modules/pkg/index.js", "module.exports = 1")
+        var options = IndexOptions()
+        options.code = true
+        #expect(names(Crawler.crawl([folder], options: options)) == ["repo/cache/store.swift"])
+    }
+
+    @Test func hashStoresAreNotWalkedButDayFoldersAre() throws {
+        for byte in 0..<64 { try write(String(format: "store/v10/files/%02x/blob.md", byte * 4)) }
+        for day in 1...31 { try write(String(format: "journal/2026-10/%02d/entry.md", day)) }
+        let report = Crawler.crawl([folder], options: IndexOptions())
+        #expect(names(report).count == 31)
+        #expect(names(report).allSatisfy { $0.hasPrefix("journal/") })
+        #expect(report.skippedFolders == ["content-addressed store": 1])
+        #expect(!Rules.looksContentAddressed((0..<40).map { String(format: "%02d", $0) }))   // no letter: not hashes
+        #expect(!Rules.looksContentAddressed((0..<20).map { String(format: "%02x", $0 * 12) }))   // too few
+        #expect(Rules.looksContentAddressed((0..<256).map { String(format: "%02x", $0) } + ["info", "pack", ".DS_Store"]))
+    }
+
+    @Test func projectsGiveUpScreenshotsNearTheTopOnly() throws {
+        try write("app/package.json", "{}")
+        try write("app/Screenshot 1.png")
+        try write("app/docs/img/Screenshot 2.png")
+        try write("app/a/b/c/d/Screenshot 3.png")       // four folders down: still looked at
+        try write("app/a/b/c/d/e/Screenshot 4.png")     // deeper: source and generated trees
+        try write("app/dist/Screenshot 5.png")          // build output
+        try write("app/docs/guide.md")                  // a project's own docs aren't the user's documents
+        try write("app/packages/web/package.json", "{}")
+        try write("app/packages/web/a/b/c/d/Screenshot 6.png")   // a nested project counts from its own root
+        try write("loose/a/b/c/d/e/f/deep.txt")         // outside a project there is no depth limit
+        let report = Crawler.crawl([folder], options: IndexOptions())
+        #expect(names(report) == ["app/Screenshot 1.png", "app/a/b/c/d/Screenshot 3.png", "app/docs/img/Screenshot 2.png",
+                                  "app/packages/web/a/b/c/d/Screenshot 6.png", "loose/a/b/c/d/e/f/deep.txt"])
+        #expect(report.skippedFolders == ["deep inside a code project": 1, "vendored or built code": 1])
+    }
+
+    @Test func aFolderChosenDeepInAProjectIsWalkedWholeInEitherOrder() throws {
+        try write("app/package.json", "{}")
+        try write("app/a/b/c/d/e/Screenshot 8.png")
+        let app = folder.appendingPathComponent("app"), deep = folder.appendingPathComponent("app/a/b/c/d")
+        #expect(names(Crawler.crawl([app], options: IndexOptions())).isEmpty)
+        #expect(names(Crawler.crawl([app, deep], options: IndexOptions())) == ["app/a/b/c/d/e/Screenshot 8.png"])
+        #expect(names(Crawler.crawl([deep, app], options: IndexOptions())) == ["app/a/b/c/d/e/Screenshot 8.png"])
+    }
+
+    @Test func aChosenProjectFolderIsStillAProject() throws {
+        try write("go.mod", "module x")
+        try write("notes.md")
+        try write("Screenshot 7.png")
+        // /var/folders/…, where the walk reports /private/var/folders/…
+        let report = Crawler.crawl([folder.standardizedFileURL], options: IndexOptions())
+        #expect(names(report) == ["Screenshot 7.png"])
+    }
+
+    @Test func evictedFilesKeepTheirRowsWhateverTheirNumber() throws {
+        try write("docs/a.txt", "alpha")
+        try write("docs/b.txt", "beta")
+        let store = try IndexStore(directory: folder.appendingPathComponent("index.noindex"))
+        let indexer = try Indexer(store: store, options: IndexOptions(), makeEmbedder: {
+            throw WorkerError.notFound("sync does not need a model")
+        })
+        let docs = folder.appendingPathComponent("docs")
+        #expect(try indexer.sync([docs]).added == 2)
+        try FileManager.default.removeItem(at: docs.appendingPathComponent("b.txt"))
+        let summary = try indexer.sync([docs])
+        #expect(summary.removed == 1 && summary.unchanged == 1)
+    }
+}

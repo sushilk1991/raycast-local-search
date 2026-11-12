@@ -21,7 +21,10 @@ public struct CrawlReport: Sendable {
 }
 
 /// Walks the chosen folders and applies `Rules`. Reads metadata only, never file contents (except the 600-byte
-/// sniff that tells a real MPEG-TS video from a TypeScript file).
+/// sniff that tells a real MPEG-TS video from a TypeScript file, and never of a file that's only in the cloud).
+///
+/// The walk is kept cheap because it repeats: it doesn't go into package stores, environments, caches, hash stores or
+/// the depths of code projects (`Rules.skipReason`), and asks the file provider nothing about files it won't index.
 ///
 /// For the code index (`IndexOptions.code`) it walks the code folders instead: code files only (`Rules.classifyCode`),
 /// in a git repo only those git keeps (`GitFiles`), and none in vendored or built folders.
@@ -29,28 +32,64 @@ public enum Crawler {
     // Text readers load whole files; bound those allocations before extraction begins.
     private static let maxDocumentBytes: Int64 = 20 * 1024 * 1024
     private static let maxImageBytes: Int64 = 50 * 1024 * 1024
+    private static let datalessFlag: UInt32 = 0x4000_0000   // SF_DATALESS: contents are in the cloud, not on disk
 
     public static func crawl(_ roots: [URL], options: IndexOptions) -> CrawlReport {
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser.path
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .contentTypeKey, .isUbiquitousItemKey,
-                                      .ubiquitousItemDownloadingStatusKey]
+        // Only what a folder listing knows. A file's type comes from its extension and its cloud state is asked for
+        // files to index: fetching both for every entry sent each one to the file provider (iCloud Drive, Dropbox),
+        // and a crawl of a synced folder with a few hundred thousand files cost minutes of that daemon's CPU.
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey]
         var report = CrawlReport()
         var projectRoots = Set<String>()
         var repos = GitRepos()
         var found: [Candidate] = []
         var foundPaths = Set<String>()   // a folder inside another root would be walked twice
         let rootPaths = Set(roots.map { $0.standardizedFileURL.path })
+        var types: [String: UTType?] = [:]       // extension → type, without touching the file
+        var syncedFolders: [String: Bool] = [:]  // folder → whether iCloud syncs it
+
+        func type(forExtension ext: String) -> UTType? {
+            if ext.isEmpty { return nil }
+            if let known = types[ext] { return known }
+            let type = UTType(filenameExtension: ext)
+            types[ext] = type
+            return type
+        }
+
+        /// Whether iCloud has a newer version than the copy here. A placeholder says so itself (`SF_DATALESS`, read
+        /// with the file's size); this is asked only about files to index, in folders iCloud syncs.
+        func awaitsDownload(_ url: URL) -> Bool {
+            let folder = url.deletingLastPathComponent()
+            let synced: Bool
+            if let known = syncedFolders[folder.path] {
+                synced = known
+            } else {
+                synced = (try? folder.resourceValues(forKeys: [.isUbiquitousItemKey]))?.isUbiquitousItem == true
+                syncedFolders[folder.path] = synced
+            }
+            guard synced else { return false }
+            let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
+            return values?.isUbiquitousItem == true && values?.ubiquitousItemDownloadingStatus != .current
+        }
 
         for root in roots.map({ $0.standardizedFileURL }) {
+            // The walk reports real paths (/private/var, where the root says /var).
+            let real = FolderSelection.realPath(root.path)
+            // Folders inside a code project (main index): how far below its root they are. Per chosen folder: one
+            // chosen deep inside a project is walked whole, whichever order the folders come in.
+            var projectDepth: [String: Int] = [:]
             if options.code {
                 repos.enterRoot(root.path)
             } else if Rules.isProjectRoot(root.path) {
-                projectRoots.insert(root.path)
+                for path in [root.path, real] {
+                    projectRoots.insert(path)
+                    projectDepth[path] = 0
+                }
             }
             // A skip applies inside the chosen folders that contain it: a folder chosen inside a skipped one is
-            // walked whole (`FolderSelection`). The walk reports real paths (/private/var, where the root says /var).
-            let real = FolderSelection.realPath(root.path)
+            // walked whole (`FolderSelection`).
             let skips = options.excludedFolders.filter {
                 FolderSelection.isInside($0, root.path) || FolderSelection.isInside($0, real)
             }.flatMap { [$0, FolderSelection.realPath($0)] }
@@ -63,17 +102,46 @@ public enum Crawler {
                 report.unreadable.append(real)
                 continue
             }
+
+            /// Why the walk doesn't go into a folder, or nil: then it's noted as a repo, a project root, or by how
+            /// deep in a project it is.
+            func skipReason(entering url: URL) -> String? {
+                if let reason = Rules.skipReason(forFolder: url, home: home, excluded: skips, code: options.code)
+                    ?? (options.code ? Rules.codeSkipReason(forFolder: url) : nil) {
+                    return reason
+                }
+                // One listing answers the rest: markers, a hash store's fan-out, a project's files.
+                let entries = (try? fm.contentsOfDirectory(atPath: url.path)) ?? []
+                if let reason = Rules.skipReason(forEntries: entries) { return reason }
+                if options.code {
+                    repos.enter(url.path)
+                    return nil
+                }
+                if Rules.isProjectRoot(entries: entries) {
+                    projectRoots.insert(url.path)
+                    projectDepth[url.path] = 0
+                    return nil
+                }
+                // Inside a project only screenshots are indexed: not worth its build output or its deep trees.
+                guard let depth = projectDepth[(url.path as NSString).deletingLastPathComponent] else { return nil }
+                if Rules.codeSkippedFolderNames.contains(url.lastPathComponent) { return "vendored or built code" }
+                if depth >= Rules.maxProjectDepth { return "deep inside a code project" }
+                projectDepth[url.path] = depth + 1
+                return nil
+            }
+
+            func notDownloaded(_ url: URL) {
+                // Eviction or cloud sync is temporary unavailability, not deletion; retain saved text/vectors.
+                report.unreadable.append(FolderSelection.realPath(url.path))
+                report.skipped["in the cloud, not downloaded", default: 0] += 1
+            }
+
             func visit(_ url: URL) {
                 let values = try? url.resourceValues(forKeys: Set(keys))
                 if values?.isDirectory == true, values?.isPackage != true {
-                    if let reason = Rules.skipReason(forFolder: url, home: home, excluded: skips)
-                        ?? (options.code ? Rules.codeSkipReason(forFolder: url) : nil) {
+                    if let reason = skipReason(entering: url) {
                         walker.skipDescendants()
                         report.skippedFolders[reason, default: 0] += 1
-                    } else if options.code {
-                        repos.enter(url.path)
-                    } else if Rules.isProjectRoot(url.path) {
-                        projectRoots.insert(url.path)
                     }
                     return
                 }
@@ -81,15 +149,23 @@ public enum Crawler {
                     report.skipped["app or bundle", default: 0] += 1
                     return
                 }
+                let ext = url.pathExtension.lowercased()
+                var info = stat()
+                // Telling a video from TypeScript reads the file's first bytes, and reading a placeholder downloads
+                // it: leave those unread and keep what was indexed from them.
+                if Rules.sniffedExtensions.contains(ext), !options.excludedExtensions.contains(ext),
+                   lstat(url.path, &info) == 0, info.st_flags & datalessFlag != 0 {
+                    notDownloaded(url)
+                    return
+                }
                 let classification = options.code ? Rules.classifyCode(url, options: options)
-                    : Rules.classify(url, type: values?.contentType, options: options)
+                    : Rules.classify(url, type: type(forExtension: ext), options: options)
                 switch classification {
                 case .ignore:
                     report.skipped["other type", default: 0] += 1
                 case .skip(let reason):
                     report.skipped[reason, default: 0] += 1
                 case .index(let kind):
-                    var info = stat()
                     guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
                         report.skipped["link or special file", default: 0] += 1
                         return
@@ -102,18 +178,13 @@ public enum Crawler {
                     }
 
                     // Reading a dataless placeholder (iCloud "Optimize Mac Storage", File Providers) downloads it.
-                    let dataless = info.st_flags & 0x4000_0000 != 0  // SF_DATALESS
-                    let inCloud = values?.isUbiquitousItem == true && values?.ubiquitousItemDownloadingStatus != .current
-                    if dataless || inCloud {
-                        // Eviction or cloud sync is temporary unavailability, not deletion; retain saved text/vectors.
-                        report.unreadable.append(FolderSelection.realPath(url.path))
-                        report.skipped["in the cloud, not downloaded", default: 0] += 1
+                    if info.st_flags & datalessFlag != 0 || awaitsDownload(url) {
+                        notDownloaded(url)
                         return
                     }
                     if options.code {
                         // Too big to be written by hand; a notebook's file holds its outputs too.
-                        let limit = url.pathExtension.lowercased() == "ipynb" ? options.maxNotebookBytes
-                            : options.maxCodeBytes
+                        let limit = ext == "ipynb" ? options.maxNotebookBytes : options.maxCodeBytes
                         if info.st_size > limit {
                             report.skipped["too big to be written by hand", default: 0] += 1
                             return

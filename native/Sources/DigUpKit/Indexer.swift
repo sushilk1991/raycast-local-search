@@ -96,6 +96,17 @@ public final class Indexer {
             byInode["\(file.device):\(file.inode)"] = file
         }
         let seen = Set(crawl.candidates.map(\.path))
+        // A synced folder can hold thousands of placeholders: look each row's folders up, don't scan the list per row.
+        let unreadable = Set(crawl.unreadable)
+        func isUnreadable(_ path: String) -> Bool {
+            var path = path
+            while !unreadable.contains(path) {
+                let parent = (path as NSString).deletingLastPathComponent
+                if parent == path || parent.isEmpty { return false }
+                path = parent
+            }
+            return true
+        }
         var movedFrom = Set<String>()
         var summary = SyncSummary(crawl: crawl)
         try store.db.transaction {
@@ -124,8 +135,7 @@ public final class Indexer {
                 .filter { !FileManager.default.fileExists(atPath: $0) }.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
             // Keep saved content beneath failed enumerations, while still pruning genuinely deleted siblings.
             for row in existing where !seen.contains(row.path) && !movedFrom.contains(row.path)
-                && !crawl.unreadable.contains(where: { row.path == $0 || FolderSelection.isInside(row.path, $0) })
-                && !vanished.contains(where: { row.path.hasPrefix($0) }) {
+                && !isUnreadable(row.path) && !vanished.contains(where: { row.path.hasPrefix($0) }) {
                 try store.delete(row.id)
                 summary.removed += 1
             }

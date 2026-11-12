@@ -10,10 +10,40 @@ public enum Classification: Equatable, Sendable {
 /// What gets indexed. The defaults come from a real developer's Mac: Spotlight types 57k TypeScript files as movies,
 /// one repo holds a 55k-clip dataset, and screenshot tools move screenshots into code projects.
 public enum Rules {
-    /// Folders never worth walking into. Hidden folders and bundles are skipped by the enumerator itself.
+    /// Folders never worth walking into, wherever they are: package stores, environments, caches and what the system
+    /// leaves behind. They hold other people's files or regenerable ones, often hundreds of thousands of them, and
+    /// names nobody gives a folder of their own documents. Hidden folders and bundles are skipped by the enumerator
+    /// itself. `service/ignored.ts` lists these and `cacheFolderNames` (a change inside one doesn't start a crawl); a test
+    /// compares.
     static let skippedFolderNames: Set<String> = [
-        "node_modules", "bower_components", "venv", "site-packages", "__pycache__", "DerivedData", "Pods", "Carthage",
+        // JavaScript
+        "node_modules", "bower_components", "jspm_packages", "web_modules", "pnpm-store",
+        // Python
+        "venv", "virtualenv", "site-packages", "__pycache__", "__pypackages__",
+        // Xcode and Swift
+        "DerivedData", "Pods", "Carthage", "xcuserdata", "SourcePackages",
+        // Other toolchains
+        "elm-stuff", "DerivedDataCache", "bazel-bin", "bazel-out", "bazel-testlogs",
+        // Caches (browsers and Electron apps keep these beside their data)
+        "CachedData", "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache", "DawnCache", "CacheStorage",
+        // What systems and archives leave behind
+        "__MACOSX", "$RECYCLE.BIN", "System Volume Information", "lost+found", "Backups.backupdb",
     ]
+
+    /// Cache folders by their plain name. Not the code index's to skip: a repo's own cache/ is source code (and git
+    /// already leaves a real cache out).
+    static let cacheFolderNames: Set<String> = ["cache", "Cache", "caches", "Caches"]
+
+    /// A file or folder that says what the folder holding it is: a cache (cargo, uv, ccache and others write
+    /// CACHEDIR.TAG), a Python environment, or a folder its owner marked as not for indexing (Spotlight's own marker).
+    static let folderMarkers: [(name: String, reason: String)] = [
+        ("CACHEDIR.TAG", "cache folder"), ("pyvenv.cfg", "python environment"), ("conda-meta", "python environment"),
+        (".metadata_never_index", "marked not to index"),
+    ]
+
+    /// How far below a code project's root the walk looks for screenshots (the only files indexed there). Screenshots
+    /// land near the top (the root, docs/, assets/); deeper is source and generated trees, tens of thousands of files.
+    static let maxProjectDepth = 4
 
     /// Any of these in a folder makes it a code project, where only screenshots are indexed.
     static let projectMarkers = [
@@ -148,17 +178,45 @@ public enum Rules {
         return screenshotPrefixes.contains { name.hasPrefix($0) }
     }
 
-    static func skipReason(forFolder url: URL, home: String, excluded: [String]) -> String? {
+    static func skipReason(forFolder url: URL, home: String, excluded: [String], code: Bool = false) -> String? {
         let name = url.lastPathComponent
         if skippedFolderNames.contains(name) { return "developer folder" }
+        if !code, cacheFolderNames.contains(name) { return "cache folder" }
         if name.hasSuffix(".noindex") { return ".noindex folder" }
         if url.path == home + "/Library" { return "~/Library" }
         if excluded.contains(where: { url.path == $0 || url.path.hasPrefix($0 + "/") }) { return "excluded folder" }
         return nil
     }
 
+    /// Why a folder isn't walked, going by what's in it (`entries`: its own listing, hidden names included), or nil.
+    static func skipReason(forEntries entries: [String]) -> String? {
+        if let marker = folderMarkers.first(where: { entries.contains($0.name) }) { return marker.reason }
+        if looksContentAddressed(entries) { return "content-addressed store" }
+        return nil
+    }
+
+    /// A store that files things by their hash: dozens of two-character hex folders (a pnpm store's files/00…ff, npm's
+    /// _cacache, a bare repo's objects, ccache, Bazel's cas). At least one name has a letter, so a month of day
+    /// folders (01…31) isn't taken for one.
+    static func looksContentAddressed(_ entries: [String], minimum: Int = 32) -> Bool {
+        let visible = entries.filter { !$0.hasPrefix(".") }
+        guard visible.count >= minimum else { return false }
+        func isHex(_ byte: UInt8) -> Bool { (48...57).contains(byte) || (97...102).contains(byte) }
+        let hex = visible.filter { $0.utf8.count == 2 && $0.utf8.allSatisfy(isHex) }
+        return hex.count >= minimum && hex.count * 10 >= visible.count * 9
+            && hex.contains { $0.utf8.contains { $0 >= 97 } }
+    }
+
+    /// Extensions whose kind only the file's first bytes tell (`isMPEGTransportStream`). The crawler doesn't read a
+    /// cloud placeholder to find out: that would download it.
+    static let sniffedExtensions: Set<String> = ["ts", "mts", "m2ts"]
+
     static func isProjectRoot(_ folder: String) -> Bool {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder) else { return false }
+        return isProjectRoot(entries: names)
+    }
+
+    static func isProjectRoot(entries names: [String]) -> Bool {
         let set = Set(names)
         return projectMarkers.contains(where: set.contains)
             || names.contains { projectBundleExtensions.contains(($0 as NSString).pathExtension) }

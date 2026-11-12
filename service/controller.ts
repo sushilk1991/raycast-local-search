@@ -35,10 +35,39 @@ import {
 
 // Indexing and query inference share one native-worker slot:
 // watchers -> dirty flag -> index worker <-- yields to <-- search request.
-const RECONCILE_MS = 60000;
 const POWER_POLL_MS = 10000;
-const DEBOUNCE_MS = 2000;
 const QUERY_IDLE_MS = 10000;
+
+// When a crawl may start. Every index worker begins by walking all chosen folders, so starting one is never free:
+// a walk each minute "to be safe" kept a synced folder's file provider busy around the clock. Watchers say when
+// something changed; the timer covers only what they cannot see, and a slow walk earns a proportionally long rest.
+export interface Timing {
+  /** Housekeeping: is the model here yet, did a drive come back, is a safety rescan due. Starts no crawl itself. */
+  tickMs: number;
+  /** Quiet time after a change before crawling. */
+  debounceMs: number;
+  /** Safety rescan while every chosen folder is watched. */
+  rescanMs: number;
+  /** Rescan while a folder cannot be watched. */
+  unwatchedRescanMs: number;
+  /** Rest this many times the last crawl's duration before the next one (10: crawling at most 1/11 of the time). */
+  restFactor: number;
+  maxRestMs: number;
+  /** First retry after a worker failed; doubles while runs keep failing without getting anything done. */
+  retryMs: number;
+  maxRetryMs: number;
+}
+
+export const DEFAULT_TIMING: Timing = {
+  tickMs: 60 * 1000,
+  debounceMs: 2000,
+  rescanMs: 6 * 60 * 60 * 1000,
+  unwatchedRescanMs: 15 * 60 * 1000,
+  restFactor: 10,
+  maxRestMs: 30 * 60 * 1000,
+  retryMs: 60 * 1000,
+  maxRetryMs: 30 * 60 * 1000,
+};
 const CACHE_LIMIT = 64;
 const COUNT_EVENTS = ["sync", "waiting", "idle"];
 const COUNT_FIELDS = ["files", "searchable", "pending", "vectors"];
@@ -71,11 +100,24 @@ export class Controller {
   private blocked: string | undefined;
   private cache = new Map<string, Hit[]>();
   private configQueue: Promise<unknown> = Promise.resolve();
+  private readonly timing: Timing;
+  // Crawl pacing: when the last walk finished, how long to stay away, and what the watchers cannot vouch for.
+  private lastCrawlAt = 0;
+  private restUntil = 0;
+  private failures = 0;
+  private progressed = false;
+  private nativeError = false;
+  private watchFailed = false;
+  private ticking = false;
+  private readonly returnedRoots = new Set<string>();
 
   constructor(
     private readonly locations: Paths,
     private readonly resourceCheck = readResourceBlock,
-  ) {}
+    timing: Partial<Timing> = {},
+  ) {
+    this.timing = { ...DEFAULT_TIMING, ...timing };
+  }
 
   async initialize(): Promise<void> {
     await mkdir(this.locations.index, { recursive: true, mode: 0o700 });
@@ -97,8 +139,8 @@ export class Controller {
     await this.refreshPower();
     this.resetWatchers();
     this.reconcile = setInterval(() => {
-      this.markDirty();
-    }, RECONCILE_MS);
+      void this.tick();
+    }, this.timing.tickMs);
     this.powerTimer = setInterval(() => {
       void this.refreshPower();
     }, POWER_POLL_MS);
@@ -194,6 +236,9 @@ export class Controller {
       this.assertRunning();
       this.resetWatchers();
       this.cache.clear();
+      // The user changed something: don't make them wait out a rest earned by the previous settings.
+      this.restUntil = 0;
+      this.failures = 0;
       this.markDirty();
       await this.refreshPower();
     });
@@ -290,6 +335,13 @@ export class Controller {
     this.schedule();
   }
 
+  // The user asked for a scan now: don't make them wait out a rest or a retry pause.
+  rescan(): void {
+    this.restUntil = 0;
+    this.failures = 0;
+    this.markDirty();
+  }
+
   async close(): Promise<void> {
     this.closed = true;
     if (this.reconcile) {
@@ -351,32 +403,87 @@ export class Controller {
     }
   }
 
-  private schedule(delay = DEBOUNCE_MS): void {
+  private schedule(delay = this.timing.debounceMs): void {
     if (this.closed) {
       return;
     }
     if (this.scheduled) {
       clearTimeout(this.scheduled);
     }
+    // Never sooner than the rest the last crawl (or failure) earned, however many changes arrive.
+    const wait = Math.max(delay, this.restUntil - Date.now());
     this.scheduled = setTimeout(() => {
       void this.index().catch((error) => {
         this.error = String(error);
         this.activity = "error";
       });
-    }, delay);
+    }, wait);
+  }
+
+  // Timer housekeeping. It asks for a crawl only when something may have changed unseen:
+  // waiting work (model, power) -> look again | a missing folder is back | the safety rescan is due.
+  private async tick(): Promise<void> {
+    if (this.closed || this.ticking) {
+      return;
+    }
+    this.ticking = true;
+    try {
+      if (this.dirty) {
+        this.schedule();
+        return;
+      }
+      if (this.config.paused || this.config.roots.length === 0) {
+        return;
+      }
+      if (await this.rootReturned()) {
+        this.resetWatchers();
+        this.markDirty();
+        return;
+      }
+      const rescan = this.watchFailed
+        ? this.timing.unwatchedRescanMs
+        : this.timing.rescanMs;
+      if (!this.worker && Date.now() - this.lastCrawlAt >= rescan) {
+        this.markDirty();
+      }
+    } finally {
+      this.ticking = false;
+    }
+  }
+
+  // A folder the worker reported missing (an unplugged drive) is readable again. Each return counts once: a folder
+  // that lists here but stays unreadable to the worker must not turn into a crawl per tick.
+  private async rootReturned(): Promise<boolean> {
+    let returned = false;
+    for (const root of this.missingRoots) {
+      const readable = await readdir(root).then(
+        () => true,
+        () => false,
+      );
+      if (!readable) {
+        this.returnedRoots.delete(root);
+      } else if (!this.returnedRoots.has(root)) {
+        this.returnedRoots.add(root);
+        returned = true;
+      }
+    }
+    return returned;
   }
 
   private resetWatchers(): void {
     // Watch startup can wait for macOS folder permission; it must not block service readiness or controls.
     this.watcher?.close();
+    this.watchFailed = false;
     this.watcher = watchFolders(
       this.config.roots,
       () => {
         this.markDirty();
       },
       (message) => {
+        this.watchFailed = true;
         this.error = `Folder watcher: ${message}; periodic rescans remain enabled`;
       },
+      this.config.excludedFolders,
     );
   }
 
@@ -534,6 +641,8 @@ export class Controller {
       args.push("--exclude-ext", this.config.excludedExtensions.join(","));
     }
     this.missingRoots = [];
+    this.progressed = false;
+    this.nativeError = false;
     const worker = startWorker(this.locations.engine, args, {
       kind: WorkerKind.Index,
       models: this.locations.models,
@@ -547,6 +656,18 @@ export class Controller {
     this.worker = worker;
     try {
       await worker.done;
+      // The engine reports a failed sync or a dead model as an event and still exits cleanly.
+      if (this.nativeError) {
+        this.retryLater();
+      } else {
+        this.failures = 0;
+        // These folders were crawled and are no longer reported missing: their next return counts again.
+        for (const root of this.returnedRoots) {
+          if (!this.missingRoots.includes(root)) {
+            this.returnedRoots.delete(root);
+          }
+        }
+      }
     } catch (error) {
       if (
         !this.stoppedWorkers.has(worker) &&
@@ -555,8 +676,10 @@ export class Controller {
         !this.closed
       ) {
         this.error = String(error);
+        this.retryLater();
       }
     } finally {
+      this.lastCrawlAt = Date.now();
       if (this.worker === worker) {
         this.worker = undefined;
         this.activity = this.error ? "error" : "idle";
@@ -568,10 +691,35 @@ export class Controller {
     }
   }
 
+  // The worker's queue is still waiting (a time budget ran out, a crash, a failed sync) and nothing else will
+  // bring it back: go on after a pause. A run that got nothing done waits twice as long each time, so a folder
+  // that cannot be crawled is not hammered.
+  private retryLater(): void {
+    this.failures = this.progressed ? 0 : this.failures + 1;
+    const retry = Math.min(
+      this.timing.maxRetryMs,
+      this.timing.retryMs * 2 ** Math.max(0, this.failures - 1),
+    );
+    this.restUntil = Math.max(this.restUntil, Date.now() + retry);
+    this.dirty = true;
+  }
+
   private onEvent(line: string): void {
     try {
       const event = JSON.parse(line);
+      if (event.event === "sync") {
+        // The walk is done; what follows is embedding. Stay away for a multiple of what the walk cost.
+        const ms = Number.isFinite(event.ms) && event.ms > 0 ? event.ms : 0;
+        this.restUntil =
+          Date.now() +
+          Math.min(this.timing.maxRestMs, this.timing.restFactor * ms);
+      }
+      // Progress is a file read, not a walk: a run that only crawls before failing must not retry at full pace.
+      if (event.event === "rest") {
+        this.progressed = true;
+      }
       if (event.event === "file") {
+        this.progressed = true;
         this.progress = {
           done: event.done,
           total: event.total,
@@ -605,6 +753,7 @@ export class Controller {
       }
       if (event.event === "error") {
         this.error = String(event.message);
+        this.nativeError = true;
       }
     } catch {
       this.error = "Invalid event from native worker";

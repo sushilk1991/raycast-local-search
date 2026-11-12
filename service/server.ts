@@ -145,7 +145,7 @@ export async function createService(locations: Paths) {
         return;
       }
       if (req.method === "POST" && req.url === "/rescan") {
-        controller.markDirty();
+        controller.rescan();
         respond(res, HTTP_OK, await controller.status());
         return;
       }
